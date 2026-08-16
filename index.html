@@ -447,7 +447,12 @@ function renderStocks(){
   let h=searchBar()+`<div style="margin-bottom:11px">${
     [['all','전체'],['buy','매수구간'],['near','돌파대기'],['sell','매도경고'],['us','해외'],['kr','한국']]
     .map(c=>`<span class="chip ${c[0]===f?'on':''}" onclick="setFilter('${c[0]}')">${c[1]}</span>`).join('')}</div>`;
-  h+=`<div class="small" style="margin-bottom:8px">관심종목 ${wl.length}개 · 분석완료 ${Object.keys(sumMap).length}개</div>`;
+    const pendingCnt=items.filter(x=>x.pending).length;
+  h+=`<div class="small" style="margin-bottom:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+    <span>관심종목 ${wl.length}개 · 분석완료 ${Object.keys(sumMap).length}개</span>
+    ${pendingCnt?`<span class="tag t-warn">대기 ${pendingCnt}</span>
+    <button class="btn sm" style="padding:4px 10px;font-size:11px" onclick="triggerAnalysis()">지금 분석 실행</button>`:''}
+  </div>`;
   if(!filt.length)h+=`<div class="empty">해당 종목이 없습니다.</div>`;
   const o={pass:0,warn:1,idle:2,fail:3};
   filt.slice().sort((a,b)=>{
@@ -481,7 +486,38 @@ function stockRowWithDel(x){
       ${tag(x.stage||'—',x.kind)}<span class="small mono">피봇 ${money(x.pivot,x.market)} ${x.gap!=null?`(${pct(x.gap)})`:''}</span>
     </div></div>`;
 }
-function wlDel(i){const wl=watchlist();const code=wl[i];wl.splice(i,1);DB.set('watchlist',wl);renderSet();
+async function triggerAnalysis(){
+  if(!ghReady()){alert('설정에서 GitHub 연동을 먼저 해주세요.');return}
+  const g=ghCfg();
+  toast('분석 실행 요청 중…');
+  try{
+    const r=await fetch(`https://api.github.com/repos/${g.owner}/${g.repo}/actions/workflows/update.yml/dispatches`,{
+      method:'POST',
+      headers:{'Authorization':'Bearer '+g.token,'Accept':'application/vnd.github+json','Content-Type':'application/json'},
+      body:JSON.stringify({ref:g.branch||'main'})
+    });
+    if(r.status===204||r.ok){
+      toast('분석이 시작되었습니다. 1~2분 후 자동 반영됩니다.');
+      if(!window._pollTimer){
+        window._pollTimer=setInterval(async()=>{
+          try{
+            await loadSummary(true);
+            const still=watchlist().filter(c=>!(SUM.items||[]).find(x=>x.code===c));
+            if(!still.length){clearInterval(window._pollTimer);window._pollTimer=null;toast('분석 완료!');}
+            if(CUR==='stocks') renderStocks();
+            else if(CUR==='home') renderHome();
+          }catch(e){}
+        },25000);
+      }
+    } else {
+      const t=await r.text();
+      throw new Error(r.status+' '+t.slice(0,100));
+    }
+  }catch(e){
+    alert('분석 실행 실패: '+e.message+'\n\n토큰에 Actions 쓰기 권한이 필요할 수 있습니다.\nFine-grained token → Permissions → Actions: Read and write');
+  }
+}
+  function wlDel(i){const wl=watchlist();const code=wl[i];wl.splice(i,1);DB.set('watchlist',wl);renderSet();
   if(ghReady()) pushWatchlist(wl).then(ok=>{if(ok)toast(code+' 삭제 + 저장소 반영')})}
 async function removeFromWatch(code){
   code=String(code||'').trim().toUpperCase();
