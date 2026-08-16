@@ -429,22 +429,57 @@ function setMarket(m){DB.set('market:pref',m);renderMarket();renderHome()}
 function renderStocks(){
   const el=$('#v-stocks');
   if(!SUM){el.innerHTML=`<div class="empty">데이터 없음</div>`;return}
-  const f=DB.get('filter:stock','all'), items=SUM.items||[];
-  const filt=items.filter(x=>{ if(x.error)return f==='all';
+  const f=DB.get('filter:stock','all');
+  const wl=watchlist();
+  const sumMap={};
+  (SUM.items||[]).forEach(x=>{sumMap[x.code]=x});
+  const codes=Array.from(new Set([...wl, ...(SUM.items||[]).map(x=>x.code)]));
+  let items=codes.map(code=>{
+    if(sumMap[code]) return sumMap[code];
+    return {code, name:code, kind:'idle', score:null, rs:null, price:null, chg:null, pivot:null, gap:null, market: /^\d{6}$/.test(code)?'KR':'US', pending:true};
+  });
+  const filt=items.filter(x=>{
+    if(x.pending) return f==='all';
+    if(x.error) return f==='all';
     if(f==='buy')return x.kind==='pass'; if(f==='near')return x.kind==='warn';
     if(f==='sell')return (x.sell||0)>=45; if(f==='kr')return x.market==='KR';
     if(f==='us')return x.market==='US'; return true });
   let h=searchBar()+`<div style="margin-bottom:11px">${
     [['all','전체'],['buy','매수구간'],['near','돌파대기'],['sell','매도경고'],['us','해외'],['kr','한국']]
     .map(c=>`<span class="chip ${c[0]===f?'on':''}" onclick="setFilter('${c[0]}')">${c[1]}</span>`).join('')}</div>`;
+  h+=`<div class="small" style="margin-bottom:8px">관심종목 ${wl.length}개 · 분석완료 ${Object.keys(sumMap).length}개</div>`;
   if(!filt.length)h+=`<div class="empty">해당 종목이 없습니다.</div>`;
   const o={pass:0,warn:1,idle:2,fail:3};
-  filt.slice().sort((a,b)=>(o[a.kind]??9)-(o[b.kind]??9)||(b.score||0)-(a.score||0)).forEach(x=>{
-    if(x.error) h+=`<div class="card"><div class="row"><div class="g"><div class="nm">${esc(x.name||x.code)}</div>
-      <div class="sub">${esc(x.code)}</div></div>${tag('수집 실패','fail')}</div>
-      <div class="d" style="margin-top:6px">${esc(x.error)}</div></div>`;
-    else h+=stockRow(x)});
+  filt.slice().sort((a,b)=>{
+    if(a.pending&&!b.pending)return 1; if(!a.pending&&b.pending)return -1;
+    return (o[a.kind]??9)-(o[b.kind]??9)||(b.score||0)-(a.score||0);
+  }).forEach(x=>{
+    if(x.pending){
+      h+=`<div class="card"><div class="row"><div class="g"><div class="nm">${esc(x.code)}</div>
+        <div class="sub">분석 대기 중 · 관심목록에만 있음</div></div>
+        <button class="btn gray sm" onclick="event.stopPropagation();removeFromWatch('${esc(x.code)}')">삭제</button></div>
+        <div class="d" style="margin-top:6px">저장소에 반영 후 Actions가 돌면 분석 결과가 표시됩니다.</div></div>`;
+    } else if(x.error){
+      h+=`<div class="card"><div class="row"><div class="g"><div class="nm">${esc(x.name||x.code)}</div>
+        <div class="sub">${esc(x.code)}</div></div>
+        <button class="btn gray sm" onclick="event.stopPropagation();removeFromWatch('${esc(x.code)}')">삭제</button></div>
+        <div class="d" style="margin-top:6px">${esc(x.error)}</div></div>`;
+    } else {
+      h+=stockRowWithDel(x);
+    }
+  });
   el.innerHTML=h;
+}
+function stockRowWithDel(x){
+  return `<div class="card tap" onclick="openStock('${esc(x.code)}')"><div class="row">
+    <div class="g"><div class="nm">${esc(x.name||x.code)}${x.is_etf?' '+tag('ETF','info'):''}</div>
+      <div class="sub">${esc(x.code)} · RS ${x.rs??'—'} · ${x.score??'—'}점${x.sell>=45?` · 매도압력 ${x.sell}`:''}</div></div>
+    <div style="text-align:right"><div class="px">${money(x.price,x.market)}</div>
+      <div class="sub ${cls(x.chg)}">${pct(x.chg,2)}</div>
+      <button class="btn gray sm" style="margin-top:4px" onclick="event.stopPropagation();removeFromWatch('${esc(x.code)}')">삭제</button></div></div>
+    <div style="margin-top:8px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+      ${tag(x.stage||'—',x.kind)}<span class="small mono">피봇 ${money(x.pivot,x.market)} ${x.gap!=null?`(${pct(x.gap)})`:''}</span>
+    </div></div>`;
 }
 function setFilter(f){DB.set('filter:stock',f);renderStocks()}
 
@@ -965,9 +1000,23 @@ function testNotify(){ if(window.Notification&&Notification.permission==='grante
   else alert('먼저 알림을 켜주세요.')}
 function wlPush(){const v=(document.getElementById('wlAdd').value||'').trim().toUpperCase();
   if(v)addToWatch(v).then?addToWatch(v):null; renderSet()}
-function wlDel(i){const wl=watchlist();wl.splice(i,1);DB.set('watchlist',wl);renderSet()}
-function clearCache(){Object.keys(localStorage).filter(k=>k.startsWith('oneil:cache'))
-  .forEach(k=>localStorage.removeItem(k));alert('캐시를 비웠습니다.');location.reload()}
+function wlDel(i){const wl=watchlist();const code=wl[i];wl.splice(i,1);DB.set('watchlist',wl);renderSet();
+  if(ghReady()) pushWatchlist(wl).then(ok=>{if(ok)toast(code+' 삭제 + 저장소 반영')})}
+async function removeFromWatch(code){
+  code=String(code||'').trim().toUpperCase();
+  if(!code)return;
+  if(!confirm(code+' 를 관심종목에서 삭제할까요?'))return;
+  const wl=watchlist().filter(c=>c!==code);
+  DB.set('watchlist',wl);
+  toast(code+' 삭제됨');
+  if(ghReady()){
+    const ok=await pushWatchlist(wl);
+    if(ok) toast(code+' 저장소에서도 제거됨');
+  }
+  if(CUR==='stocks') renderStocks();
+  else if(CUR==='set') renderSet();
+  else if(CUR==='home') renderHome();
+}
 
 /* ══════════ 내비 ══════════ */
 const RENDER={home:renderHome,market:renderMarket,stocks:renderStocks,school:renderSchool,my:renderMy,set:renderSet};
