@@ -481,6 +481,23 @@ function stockRowWithDel(x){
       ${tag(x.stage||'—',x.kind)}<span class="small mono">피봇 ${money(x.pivot,x.market)} ${x.gap!=null?`(${pct(x.gap)})`:''}</span>
     </div></div>`;
 }
+function wlDel(i){const wl=watchlist();const code=wl[i];wl.splice(i,1);DB.set('watchlist',wl);renderSet();
+  if(ghReady()) pushWatchlist(wl).then(ok=>{if(ok)toast(code+' 삭제 + 저장소 반영')})}
+async function removeFromWatch(code){
+  code=String(code||'').trim().toUpperCase();
+  if(!code)return;
+  if(!confirm(code+' 를 관심종목에서 삭제할까요?'))return;
+  const wl=watchlist().filter(c=>c!==code);
+  DB.set('watchlist',wl);
+  toast(code+' 삭제됨');
+  if(ghReady()){
+    const ok=await pushWatchlist(wl);
+    if(ok) toast(code+' 저장소에서도 제거됨');
+  }
+  if(CUR==='stocks') renderStocks();
+  else if(CUR==='set') renderSet();
+  else if(CUR==='home') renderHome();
+}
 function setFilter(f){DB.set('filter:stock',f);renderStocks()}
 
 async function openStock(code){
