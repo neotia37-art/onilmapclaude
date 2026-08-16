@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 
 KST = timezone(timedelta(hours=9))
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(ROOT, "data")
 os.makedirs(os.path.join(DATA, "stock"), exist_ok=True)
 
