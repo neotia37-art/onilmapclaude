@@ -7,13 +7,19 @@
       "code": "NTAP"
     },
     {
-      "code": "STX"
+      "code": "AMD"
+    },
+    {
+      "code": "005930"
     },
     {
       "code": "MU"
     },
     {
-      "code": "NVDA"
+      "code": "000680"
+    },
+    {
+      "code": "TSLA"
     }
   ]
 }
