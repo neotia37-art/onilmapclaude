@@ -1,0 +1,13 @@
+{
+  "_comment": "여기에 분석할 종목을 넣으세요. 앱 설정 탭의 '목록 JSON 복사'로 만든 내용을 붙여넣으면 됩니다.",
+  "items": [
+    {"code": "NVDA"},
+    {"code": "ANET"},
+    {"code": "AVGO"},
+    {"code": "VRT"},
+    {"code": "GEV"},
+    {"code": "MU"},
+    {"code": "005930"},
+    {"code": "000660"}
+  ]
+}
