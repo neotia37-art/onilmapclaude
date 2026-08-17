@@ -186,8 +186,12 @@ const isKR=c=>/^[0-9A-Z]{6}$/.test(c)&&/\d/.test(c);
 /* ── 데이터 ── */
 async function loadSummary(force){
   try{
+    if(force){
+      try{ localStorage.removeItem('oneil:cache:summary'); localStorage.removeItem('oneil:cache:at'); }catch(e){}
+      DETAIL={};
+    }
     const r=await fetch('data/summary.json?t='+(force?Date.now():Math.floor(Date.now()/300000)),
-      {cache:force?'reload':'default'});
+      {cache:force?'reload':'no-cache'});
     if(!r.ok) throw new Error(r.status);
     const j=await r.json(); SUM=j; DB.set('cache:summary',j); DB.set('cache:at',Date.now()); return j;
   }catch(e){ if(SUM) return SUM; throw e; }
@@ -931,9 +935,12 @@ async function addToWatch(code){
   if(ghReady()){
     toast('저장소에 반영 중…');
     const ok=await pushWatchlist(wl);
-    if(ok){ alert(`${code} 를 관심종목에 추가하고 저장소에 반영했습니다.\n\n` +
-      `GitHub Actions가 자동으로 실행됩니다. 2~3분 뒤 새로고침하면 분석 결과가 나옵니다.`); }
-  } else {
+       if(ok){
+      toast(code+' 반영 완료 · 분석 시작');
+      try{ await triggerAnalysis(); }catch(e){}
+      if(CUR==='stocks') renderStocks();
+      else if(CUR==='home') renderHome();
+    } else {
     go('set');
     setTimeout(()=>alert(`${code} 를 휴대폰 관심목록에 추가했습니다.\n\n` +
       `분석까지 되게 하려면 아래 두 방법 중 하나가 필요합니다.\n` +
@@ -948,16 +955,23 @@ async function pushWatchlist(wl){
   const content=btoa(unescape(encodeURIComponent(JSON.stringify(body,null,2))));
   const base=`https://api.github.com/repos/${g.owner}/${g.repo}/contents/${path}`;
   const hdr={'Authorization':'Bearer '+g.token,'Accept':'application/vnd.github+json'};
-  try{
-    let sha=null;
-    const r0=await fetch(base+`?ref=${encodeURIComponent(g.branch||'main')}`,{headers:hdr});
-    if(r0.ok){ const j=await r0.json(); sha=j.sha; }
-    const r=await fetch(base,{method:'PUT',headers:{...hdr,'Content-Type':'application/json'},
-      body:JSON.stringify({message:'관심종목 갱신 (모바일)',content,branch:g.branch||'main',
-        ...(sha?{sha}:{})})});
-    if(!r.ok){ const t=await r.text(); throw new Error(r.status+' '+t.slice(0,120)); }
-    return true;
-  }catch(e){ alert('저장소 반영 실패: '+e.message+'\n\n설정에서 GitHub 정보를 확인하세요.'); return false; }
+  for(let attempt=0; attempt<3; attempt++){
+    try{
+      let sha=null;
+      const r0=await fetch(base+`?ref=${encodeURIComponent(g.branch||'main')}`,{headers:hdr,cache:'no-store'});
+      if(r0.ok){ const j=await r0.json(); sha=j.sha; }
+      const r=await fetch(base,{method:'PUT',headers:{...hdr,'Content-Type':'application/json'},
+        body:JSON.stringify({message:'관심종목 갱신 (모바일)',content,branch:g.branch||'main',
+          ...(sha?{sha}:{})})});
+      if(r.status===409) continue;
+      if(!r.ok){ const t=await r.text(); throw new Error(r.status+' '+t.slice(0,120)); }
+      return true;
+    }catch(e){
+      if(attempt===2){ alert('저장소 반영 실패: '+e.message+'\n\n설정에서 GitHub 정보를 확인하세요.'); return false; }
+    }
+  }
+  alert('저장소 반영 실패: 파일이 계속 변경되고 있습니다. 잠시 후 다시 시도하세요.');
+  return false;
 }
 async function testGh(){
   const g=ghCfg();
