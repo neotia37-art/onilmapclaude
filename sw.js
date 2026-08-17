@@ -1,5 +1,5 @@
 /* 오닐 터미널 — 오프라인 캐시 + 알림 */
-const V = 'oneil-v1';
+const V = 'oneil-v2';
 const SHELL = ['./', './index.html', './manifest.webmanifest'];
 
 self.addEventListener('install', e => {
