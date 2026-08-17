@@ -1083,6 +1083,19 @@ function go(v){CUR=v;
       <span class="small">${esc(e.message||e)}</span></div>`}
   window.scrollTo({top:0})}
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>go(b.dataset.v));
+  function clearCache(){
+  try{
+    const keys=[];
+    for(let i=0;i<localStorage.length;i++){
+      const k=localStorage.key(i);
+      if(k&&k.startsWith('oneil:cache')) keys.push(k);
+    }
+    keys.forEach(k=>localStorage.removeItem(k));
+  }catch(e){}
+  SUM=null; DETAIL={};
+  toast('캐시를 비웠습니다. 다시 불러오는 중…');
+  refresh(true);
+}
 async function refresh(force){
   const b=$('#btnRefresh');b.innerHTML='<span class="spin"></span>';
   try{ await loadSummary(force); $('#hdAs').textContent=SUM?(SUM.asof_kr||''):'—';
