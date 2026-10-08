@@ -41,6 +41,18 @@ try:
 except Exception:
     krx = None
     HAS_KRX = False
+# KRX 데이터포털(data.krx.co.kr)은 2026-02부터 로그인 없이 조회하면 HTTP 400 "LOGOUT"을 준다.
+# pykrx(1.2.8+)는 KRX_ID/KRX_PW 환경변수가 있을 때만 로그인한다. 없으면 pykrx의 시세·재무·
+# 시총·종목명·지수 함수가 JSON 대신 "LOGOUT"을 받아 빈 표를 돌려주므로(예외 없음) 아예 쓰지 않고
+# FinanceDataReader 상장목록 · 네이버 증권 · yfinance 로 대신한다.
+KRX_LOGIN = bool(os.environ.get("KRX_ID") and os.environ.get("KRX_PW"))
+USE_KRX = HAS_KRX and KRX_LOGIN
+try:
+    import dart_kr          # OpenDart 재무 (DART_API_KEY 있을 때만 동작)
+    HAS_DART = bool(dart_kr.DART_KEY)
+except Exception:
+    dart_kr = None
+    HAS_DART = False
 
 LOG = []
 
@@ -157,7 +169,7 @@ def fetch(code, market=None):
     if kr:
         if HAS_FDR:
             tries.append(("fdr", lambda: fdr.DataReader(code)))
-        if HAS_KRX:
+        if USE_KRX:
             tries.append(("pykrx", lambda: krx.get_market_ohlcv_by_date(
                 "20050101", datetime.now(KST).strftime("%Y%m%d"), code)))
         if HAS_YF:
@@ -179,6 +191,95 @@ def fetch(code, market=None):
         except Exception as e:
             log(f"시세 {code}", "재시도", f"{nm}: {type(e).__name__}")
     return None, None
+
+
+UA = {"User-Agent": "Mozilla/5.0"}
+_KR_LIST = None
+_KR_ETF = None
+_NAVER = {}
+
+
+def kr_listing():
+    """FinanceDataReader KRX 상장목록 {code: {name, market, marcap(원), shares}} — 1회 캐시."""
+    global _KR_LIST
+    if _KR_LIST is None:
+        _KR_LIST = {}
+        if HAS_FDR:
+            try:
+                d = fdr.StockListing("KRX")
+                for r in d.itertuples(index=False):
+                    _KR_LIST[str(r.Code).zfill(6)] = {
+                        "name": str(r.Name), "market": str(r.Market),
+                        "marcap": R(getattr(r, "Marcap", None), 0),
+                        "shares": R(getattr(r, "Stocks", None), 0)}
+                log("KR 상장목록", "성공", f"FDR · {len(_KR_LIST)}종목")
+            except Exception as e:
+                log("KR 상장목록", "실패", f"FDR StockListing: {type(e).__name__}: {e}")
+    return _KR_LIST
+
+
+def kr_etf_listing():
+    """FDR 국내 ETF 목록 {code: {name, price, nav, aum(원)}} — 1회 캐시."""
+    global _KR_ETF
+    if _KR_ETF is None:
+        _KR_ETF = {}
+        if HAS_FDR:
+            try:
+                d = fdr.StockListing("ETF/KR")
+                for r in d.itertuples(index=False):
+                    cap = R(getattr(r, "MarCap", None), 0)
+                    _KR_ETF[str(r.Symbol).zfill(6)] = {
+                        "name": str(r.Name), "price": R(getattr(r, "Price", None)),
+                        "nav": R(getattr(r, "NAV", None)),
+                        "aum": cap * 1e8 if cap else None}          # MarCap 단위: 억원
+            except Exception as e:
+                log("KR ETF목록", "실패", f"FDR ETF/KR: {type(e).__name__}: {e}")
+    return _KR_ETF
+
+
+def _num(v):
+    """'11.80배' '22,292원' '-624원' '0.15%' 'N/A' → float | None"""
+    m = re.search(r"-?[0-9][0-9,]*\.?[0-9]*", str(v or ""))
+    if not m:
+        return None
+    try:
+        return float(m.group(0).replace(",", ""))
+    except Exception:
+        return None
+
+
+def _krw(v):
+    """'1,537조 5,713억' → 원"""
+    s = str(v or "").replace(",", "")
+    jo = re.search(r"([0-9.]+)\s*조", s)
+    eok = re.search(r"([0-9.]+)\s*억", s)
+    if not jo and not eok:
+        return None
+    return (float(jo.group(1)) * 1e12 if jo else 0) + (float(eok.group(1)) * 1e8 if eok else 0)
+
+
+def naver_stock(code):
+    """네이버 증권 모바일 API: 종목명·시장·ETF여부·PER/PBR/EPS/BPS·시총·NAV·보수 — 1회 캐시."""
+    if code in _NAVER:
+        return _NAVER[code]
+    out = {}
+    if requests:
+        try:
+            b = requests.get(f"https://m.stock.naver.com/api/stock/{code}/basic",
+                             headers=UA, timeout=10).json()
+            ex = str((b.get("stockExchangeType") or {}).get("name") or "").upper()
+            out.update({"name": b.get("stockName"), "end": b.get("stockEndType"),
+                        "seg": "KOSDAQ" if "KOSDAQ" in ex else "KOSPI" if "KOSPI" in ex else None,
+                        "close": _num(b.get("closePrice"))})
+            j = requests.get(f"https://m.stock.naver.com/api/stock/{code}/integration",
+                             headers=UA, timeout=10).json()
+            for x in j.get("totalInfos") or []:
+                if x.get("code"):
+                    out[x["code"]] = x.get("value")
+        except Exception as e:
+            log(f"네이버 {code}", "재시도", f"{type(e).__name__}: {e}")
+    _NAVER[code] = out
+    return out
 
 
 def fetch_index(code, market):
@@ -930,7 +1031,7 @@ def us_fund(code, price):
 
 def kr_fund(code, price, seg=None):
     F = _blank_fin()
-    if HAS_KRX:
+    if USE_KRX:
         try:
             end = datetime.now(KST).strftime("%Y%m%d")
             st0 = (datetime.now(KST) - timedelta(days=30)).strftime("%Y%m%d")
@@ -948,6 +1049,21 @@ def kr_fund(code, price, seg=None):
                 F["shares"] = R(cap["상장주식수"].iloc[-1], 0)
         except Exception as e:
             log(f"재무 {code}", "재시도", f"pykrx: {type(e).__name__}")
+    if F["per"] is None and F["pbr"] is None:
+        nv = naver_stock(code)
+        per, pbr, eps, bps = (_num(nv.get(k)) for k in ("per", "pbr", "eps", "bps"))
+        if any(v is not None for v in (per, pbr, eps, bps)):
+            F["per"], F["pbr"], F["eps_ttm"] = R(per), R(pbr), R(eps, 0)
+            if eps is not None and bps and bps > 0:
+                F["roe"] = R(eps / bps * 100, 1)
+            F["src"].append("네이버")
+    if F["mktcap"] is None:
+        L = kr_listing().get(code) or {}
+        if L.get("marcap"):
+            F["mktcap"], F["shares"] = L["marcap"], L.get("shares")
+            F["src"].append("FDR 상장목록")
+        elif _krw(naver_stock(code).get("marketValue")):
+            F["mktcap"] = R(_krw(naver_stock(code).get("marketValue")), 0)
     if HAS_YF:
         for sfx in ([".KS", ".KQ"] if seg != "KOSDAQ" else [".KQ", ".KS"]):
             try:
@@ -959,6 +1075,10 @@ def kr_fund(code, price, seg=None):
                 break
             except Exception:
                 continue
+    if HAS_DART:
+        F = dart_kr.enrich_kr_fund(F, code, price, LOG)
+    if not F["src"]:
+        log(f"재무 {code}", "실패", "네이버·yfinance·DART 모두 실패 (pykrx는 KRX 로그인 필요)")
     return F
 
 
@@ -966,7 +1086,12 @@ def kr_fund(code, price, seg=None):
 # ETF
 # ════════════════════════════════════════════════════════════════════
 def is_etf_kr(code, name):
-    if HAS_KRX:
+    if code in kr_etf_listing():
+        return True
+    end = naver_stock(code).get("end")
+    if end:
+        return str(end).lower() in ("etf", "etn")
+    if USE_KRX:
         try:
             if code in set(krx.get_etf_ticker_list(datetime.now(KST).strftime("%Y%m%d"))):
                 return True
@@ -996,9 +1121,9 @@ def etf_pack(code, market, name, df):
         if r is not None and n >= 252:
             cagr = R(((1 + r / 100) ** (1 / (n / 252)) - 1) * 100, 1)
         P["rets"].append({"기간": lab, "r": r, "cagr": cagr})
-    if market == "KR" and HAS_KRX:
+    if market == "KR":
         d0 = datetime.now(KST)
-        for back in range(12):
+        for back in (range(12) if USE_KRX else []):
             ds = (d0 - timedelta(days=back)).strftime("%Y%m%d")
             try:
                 pdf = krx.get_etf_portfolio_deposit_file(code, ds)
@@ -1030,8 +1155,9 @@ def etf_pack(code, market, name, df):
                 break
             except Exception:
                 continue
-        for fn, key, col in ((getattr(krx, "get_etf_price_deviation", None), "deviation", "괴리율"),
-                             (getattr(krx, "get_etf_tracking_error", None), "track_err", "추적")):
+        for fn, key, col in (((getattr(krx, "get_etf_price_deviation", None), "deviation", "괴리율"),
+                              (getattr(krx, "get_etf_tracking_error", None), "track_err", "추적"))
+                             if USE_KRX else ()):
             if fn is None:
                 continue
             try:
@@ -1043,13 +1169,26 @@ def etf_pack(code, market, name, df):
                         P[key] = R(r_[cn].iloc[-1])
             except Exception:
                 pass
-        try:
-            cap = krx.get_market_cap((d0 - timedelta(days=20)).strftime("%Y%m%d"),
-                                     d0.strftime("%Y%m%d"), code)
-            if cap is not None and not cap.empty:
-                P["aum"] = R(cap["시가총액"].iloc[-1], 0)
-        except Exception:
-            pass
+        if USE_KRX:
+            try:
+                cap = krx.get_market_cap((d0 - timedelta(days=20)).strftime("%Y%m%d"),
+                                         d0.strftime("%Y%m%d"), code)
+                if cap is not None and not cap.empty:
+                    P["aum"] = R(cap["시가총액"].iloc[-1], 0)
+            except Exception:
+                pass
+        E = kr_etf_listing().get(code) or {}
+        nv = naver_stock(code)
+        if P["aum"] is None and E.get("aum"):
+            P["aum"] = R(E["aum"], 0)
+            P["src"].append("FDR ETF목록")
+        if P["deviation"] is None:
+            pr, nav = (E.get("price"), E.get("nav")) if E.get("nav") else (nv.get("close"), _num(nv.get("nav")))
+            if pr and nav:
+                P["deviation"] = R((pr / nav - 1) * 100)
+        if P["expense"] is None and _num(nv.get("fundPay")) is not None:
+            P["expense"] = _num(nv.get("fundPay"))
+            P["src"].append("네이버")
         if requests:
             try:
                 html = requests.get(f"https://finance.naver.com/item/coinfo.naver?code={code}",
@@ -1176,7 +1315,7 @@ def build_news(code, market, limit=12):
 # ════════════════════════════════════════════════════════════════════
 # 종합
 # ════════════════════════════════════════════════════════════════════
-def analyze(code, name, df, market, uni_r, idx_series, pulse_ok, seg=None):
+def analyze(code, name, df, market, uni_r, idx_series, pulse_ok, seg=None, prev_rs=None):
     px = float(df["Close"].iloc[-1])
     c = df["Close"]
     A = {"code": code, "name": name, "market": market, "price": R(px),
@@ -1249,6 +1388,10 @@ def analyze(code, name, df, market, uni_r, idx_series, pulse_ok, seg=None):
     if uni_r and all(A["rets"].get(k) is not None for k in ("r3", "r6", "r12")):
         sc = 0.4 * A["rets"]["r3"] + 0.3 * A["rets"]["r6"] + 0.3 * A["rets"]["r12"]
         A["rs"] = min(99, int(round(float((np.array(uni_r) < sc).mean() * 98))) + 1)
+        A["rs_asof"] = A["date"]
+    elif not uni_r and prev_rs and prev_rs[0] is not None:
+        # 기준 분포를 못 구하면 직전 실행 RS 유지 (rs_asof = 그 RS를 실제로 계산한 날)
+        A["rs"], A["rs_asof"], A["rs_prev"] = prev_rs[0], prev_rs[1], True
     else:
         A["rs"] = None
 
@@ -1327,40 +1470,139 @@ def load_watchlist():
     return [{"code": "NVDA"}, {"code": "ANET"}, {"code": "005930"}, {"code": "000660"}]
 
 
-def universe_returns(market):
+US_UNIVERSE = ("AAPL MSFT NVDA AMZN GOOGL META TSLA AVGO LLY JPM V UNH XOM MA JNJ PG COST "
+               "HD ABBV WMT NFLX CRM BAC KO PEP AMD ADBE TMO LIN MRK CVX ACN MCD CSCO ABT "
+               "ORCL DHR WFC TXN INTU IBM QCOM NOW GE CAT AMGN PFE UNP ISRG SPGI RTX BKNG "
+               "HON UBER PGR LOW BLK SYK AMAT ELV TJX VRTX MDT LMT ADI PLD REGN SCHW MU C "
+               "BSX CB ETN KLAC PANW SNPS CDNS MRVL CRWD FTNT ANET DELL ON MCHP NXPI TER "
+               "FSLR GEV VRT COIN SHOP ABNB DASH SNOW DDOG NET ZS TTD PLTR RBLX TEAM MDB "
+               "CEG VST NRG PWR NEE DUK SO AEP SLB HAL OXY COP EOG PSX MPC VLO DE BA GD").split()
+KR_UNIVERSE_N = 500                       # 시총 상위 N (코스피+코스닥)
+RS_CACHE = os.path.join(DATA, "rs_universe.json")
+RS_CACHE_DAYS = 10
+
+
+def _rs_from_prices(px, label):
+    """종가 표(행=날짜, 열=종목) → 0.4·3M + 0.3·6M + 0.3·12M 점수 리스트."""
+    px = px.dropna(how="all", axis=1).dropna(how="all", axis=0)
+    # Yahoo는 장 마감 직후(KST 아침=미국 저녁) 막 끝난 세션을 가격 없는 행으로 내려줄 때가 있다.
+    # 그 행을 iloc[-1]로 쓰면 모든 종목 수익률이 NaN → dropna() 후 빈 리스트 → RS 전부 None.
+    dropped = 0
+    while len(px) and px.iloc[-1].notna().mean() < 0.8:
+        px = px.iloc[:-1]
+        dropped += 1
+    if dropped and len(px):
+        log(f"RS 유니버스 {label}", "보정",
+            f"가격이 빈 최신 행 {dropped}개 제외 · 기준일 {px.index[-1]:%Y-%m-%d}")
+    px = px.ffill(limit=5)
+    if len(px) < 253:
+        raise ValueError(f"가격 이력 부족 ({len(px)}일, 253일 필요)")
+    r3 = (px.iloc[-1] / px.iloc[-64] - 1) * 100
+    r6 = (px.iloc[-1] / px.iloc[-127] - 1) * 100
+    r12 = (px.iloc[-1] / px.iloc[-253] - 1) * 100
+    return (0.4 * r3 + 0.3 * r6 + 0.3 * r12).replace([np.inf, -np.inf], np.nan).dropna().tolist()
+
+
+def _kr_universe_symbols(n=KR_UNIVERSE_N):
+    L = kr_listing()
+    rows = [(c, v) for c, v in L.items()
+            if v.get("market") in ("KOSPI", "KOSDAQ", "KOSDAQ GLOBAL") and v.get("marcap")]
+    if rows:
+        rows.sort(key=lambda x: -x[1]["marcap"])
+        return [c + (".KS" if v["market"] == "KOSPI" else ".KQ") for c, v in rows[:n]], "FDR 상장목록"
+    syms = []
+    if requests:
+        for mk, sfx in (("KOSPI", ".KS"), ("KOSDAQ", ".KQ")):
+            for page in (1, 2):
+                try:
+                    j = requests.get(f"https://m.stock.naver.com/api/stocks/marketValue/{mk}"
+                                     f"?page={page}&pageSize=100", headers=UA, timeout=10).json()
+                    syms += [x["itemCode"] + sfx for x in j.get("stocks") or []
+                             if x.get("stockEndType") == "stock"]
+                except Exception as e:
+                    log("RS 유니버스 KR", "재시도", f"네이버 시총순위 {mk}: {type(e).__name__}")
+    return syms, "네이버 시총순위"
+
+
+def _universe_live(market):
+    if market == "KR":
+        if USE_KRX:
+            try:
+                end = datetime.now(KST).strftime("%Y%m%d")
+                r = {}
+                for k, days in [("r3", 92), ("r6", 183), ("r12", 365)]:
+                    ch = krx.get_market_price_change(
+                        (datetime.now(KST) - timedelta(days=days)).strftime("%Y%m%d"), end,
+                        market="ALL")
+                    r[k] = ch["등락률"]
+                d = pd.DataFrame(r).dropna()
+                sc = (0.4 * d["r3"] + 0.3 * d["r6"] + 0.3 * d["r12"]).tolist()
+                if sc:
+                    return sc, "pykrx 전종목"
+            except Exception as e:
+                log("RS 유니버스 KR", "재시도", f"pykrx: {type(e).__name__}: {e}")
+        if not HAS_YF:
+            raise RuntimeError("yfinance 없음")
+        syms, src = _kr_universe_symbols()
+        if not syms:
+            raise RuntimeError("KR 유니버스 종목 목록을 못 만들었습니다 (FDR·네이버 실패)")
+        px = yf.download(syms, period="400d", progress=False, auto_adjust=True,
+                         threads=True)["Close"]
+        return _rs_from_prices(px, "KR"), f"{src} 시총상위 {len(syms)} · yfinance"
+    if market == "US":
+        if not HAS_YF:
+            raise RuntimeError("yfinance 없음")
+        px = yf.download(US_UNIVERSE, period="400d", progress=False, auto_adjust=True,
+                         threads=False)["Close"]
+        return _rs_from_prices(px, "US"), f"yfinance 대형주 {len(US_UNIVERSE)}"
+    return None, None
+
+
+def _rs_cache_load():
     try:
-        if market == "KR" and HAS_KRX:
-            end = datetime.now(KST).strftime("%Y%m%d")
-            r = {}
-            for k, days in [("r3", 92), ("r6", 183), ("r12", 365)]:
-                ch = krx.get_market_price_change(
-                    (datetime.now(KST) - timedelta(days=days)).strftime("%Y%m%d"), end,
-                    market="ALL")
-                r[k] = ch["등락률"]
-            d = pd.DataFrame(r).dropna()
-            return (0.4 * d["r3"] + 0.3 * d["r6"] + 0.3 * d["r12"]).tolist()
-        if market == "US" and HAS_YF:
-            syms = ("AAPL MSFT NVDA AMZN GOOGL META TSLA AVGO LLY JPM V UNH XOM MA JNJ PG COST "
-                    "HD ABBV WMT NFLX CRM BAC KO PEP AMD ADBE TMO LIN MRK CVX ACN MCD CSCO ABT "
-                    "ORCL DHR WFC TXN INTU IBM QCOM NOW GE CAT AMGN PFE UNP ISRG SPGI RTX BKNG "
-                    "HON UBER PGR LOW BLK SYK AMAT ELV TJX VRTX MDT LMT ADI PLD REGN SCHW MU C "
-                    "BSX CB ETN KLAC PANW SNPS CDNS MRVL CRWD FTNT ANET DELL ON MCHP NXPI TER "
-                    "FSLR GEV VRT COIN SHOP ABNB DASH SNOW DDOG NET ZS TTD PLTR RBLX TEAM MDB "
-                    "CEG VST NRG PWR NEE DUK SO AEP SLB HAL OXY COP EOG PSX MPC VLO DE BA GD").split()
-            px = yf.download(syms, period="400d", progress=False, auto_adjust=True,
-                             threads=False)["Close"].dropna(how="all", axis=1)
-            r3 = (px.iloc[-1] / px.iloc[-64] - 1) * 100
-            r6 = (px.iloc[-1] / px.iloc[-127] - 1) * 100
-            r12 = (px.iloc[-1] / px.iloc[-253] - 1) * 100
-            return (0.4 * r3 + 0.3 * r6 + 0.3 * r12).dropna().tolist()
+        with open(RS_CACHE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def universe_returns(market):
+    """RS 기준 분포. 실패·빈 결과면 로그를 남기고 직전 성공분(최대 RS_CACHE_DAYS일)을 쓴다."""
+    sc, src = None, None
+    try:
+        sc, src = _universe_live(market)
     except Exception as e:
-        log(f"RS 유니버스 {market}", "실패", e)
+        log(f"RS 유니버스 {market}", "실패", f"{type(e).__name__}: {e}")
+    cache = _rs_cache_load()
+    if sc:
+        log(f"RS 유니버스 {market}", "성공", f"{src} · {len(sc)}종목")
+        cache[market] = {"asof": datetime.now(KST).isoformat(timespec="seconds"),
+                         "src": src, "scores": [R(x, 2) for x in sc]}
+        try:
+            with open(RS_CACHE, "w", encoding="utf-8") as f:
+                json.dump(cache, f, ensure_ascii=False, separators=(",", ":"))
+        except Exception as e:
+            log(f"RS 유니버스 {market}", "재시도", f"캐시 저장: {e}")
+        return sc
+    log(f"RS 유니버스 {market}", "실패", "RS 기준 분포가 비었습니다 — 이번 실행 RS 계산 불가")
+    c = cache.get(market) or {}
+    try:
+        age = datetime.now(KST) - datetime.fromisoformat(c["asof"])
+        if c.get("scores") and age <= timedelta(days=RS_CACHE_DAYS):
+            log(f"RS 유니버스 {market}", "대체",
+                f'직전 성공분 사용 ({c["asof"][:16]} · {c.get("src")} · {len(c["scores"])}종목)')
+            return [x for x in c["scores"] if x is not None]
+    except Exception:
+        pass
     return None
 
 
 def name_of(code, market):
     if market == "KR":
-        if HAS_KRX:
+        for src in (kr_listing().get(code), kr_etf_listing().get(code), naver_stock(code)):
+            if src and src.get("name"):
+                return str(src["name"])
+        if USE_KRX:
             for fn in (getattr(krx, "get_market_ticker_name", None),
                        getattr(krx, "get_etf_ticker_name", None)):
                 if fn is None:
@@ -1371,6 +1613,7 @@ def name_of(code, market):
                         return str(n)
                 except Exception:
                     pass
+        log(f"종목명 {code}", "실패", "FDR·네이버 모두 실패 — 코드로 표시")
     elif HAS_YF:
         try:
             i = yf.Ticker(code).info or {}
@@ -1381,7 +1624,12 @@ def name_of(code, market):
 
 
 def kr_seg(code):
-    if HAS_KRX:
+    mk = (kr_listing().get(code) or {}).get("market")
+    if mk:
+        return "KOSDAQ" if mk.startswith("KOSDAQ") else "KOSPI" if mk == "KOSPI" else mk
+    if naver_stock(code).get("seg"):
+        return naver_stock(code)["seg"]
+    if USE_KRX:
         try:
             d = datetime.now(KST).strftime("%Y%m%d")
             for mk in ("KOSPI", "KOSDAQ"):
@@ -1432,9 +1680,25 @@ def main():
             uni[mk] = universe_returns(mk)
         nm = w.get("name") or name_of(code, mk)
         seg = kr_seg(code) if mk == "KR" else None
+        prev_rs = None
+        if not uni.get(mk):
+            try:
+                with open(os.path.join(DATA, "stock", f"{code}.json"), encoding="utf-8") as f:
+                    pj = json.load(f)
+                p_asof = pj.get("rs_asof") or pj.get("date")
+                if pj.get("rs") is not None and p_asof and (
+                        now.date() - datetime.strptime(p_asof[:10], "%Y-%m-%d").date()
+                ).days <= RS_CACHE_DAYS:
+                    prev_rs = (pj["rs"], p_asof[:10])
+            except Exception:
+                prev_rs = None
         try:
             a = analyze(code, nm, df, mk, uni.get(mk), idx_series.get(mk),
-                        pulses.get(mk, {}).get("state") == "confirmed_uptrend", seg)
+                        pulses.get(mk, {}).get("state") == "confirmed_uptrend", seg, prev_rs)
+            if a.get("rs_prev"):
+                log(f"종목 {code}", "대체", f'RS 기준 분포 없음 → 직전 실행 RS {a["rs"]} ({a["rs_asof"]}) 유지')
+            elif a.get("rs") is None:
+                log(f"종목 {code}", "경고", "RS 없음 (기준 분포 없음 또는 12개월 이력 부족)")
         except Exception as e:
             log(f"종목 {code}", "실패", f"분석 오류 {type(e).__name__}: {e}")
             items.append({"code": code, "market": mk, "name": nm,
