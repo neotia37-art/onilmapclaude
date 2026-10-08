@@ -1,9 +1,14 @@
 name: 데이터 갱신
 
 on:
+  # cron은 UTC. (원래 '10 7'=KST 16:10, '30 21'=KST 06:30 — 변환은 맞았음)
+  # 정각·30분·10분 같은 혼잡 시각의 스케줄은 GitHub가 몇 시간씩 늦게 돌리므로
+  # 한산한 분으로 옮기고 1시간 반 뒤 백업 스케줄을 둔다 (백업은 직전 갱신이 2시간 이내면 생략).
   schedule:
-    - cron: '10 7 * * 1-5'
-    - cron: '30 21 * * 1-5'
+    - cron: '17 7 * * 1-5'    # KST 16:17 월~금 · 한국 장 마감(15:30) 후
+    - cron: '43 8 * * 1-5'    # KST 17:43 백업
+    - cron: '41 21 * * 1-5'   # KST 06:41 화~토 · 미국 장 마감(KST 05:00/06:00) 후
+    - cron: '13 23 * * 1-5'   # KST 08:13 백업
   workflow_dispatch:
   push:
     paths:
@@ -20,28 +25,48 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
+      - name: 백업 스케줄 중복 확인
+        id: gate
+        if: github.event_name == 'schedule' && (github.event.schedule == '43 8 * * 1-5' || github.event.schedule == '13 23 * * 1-5')
+        run: |
+          last=$(git log -1 --format=%ct --grep='^데이터 갱신' origin/main || true)
+          age=$(( $(date +%s) - ${last:-0} ))
+          if [ "$age" -lt 7200 ]; then
+            echo "직전 데이터 갱신이 $((age / 60))분 전 — 백업 실행 생략"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "직전 갱신 $((age / 60))분 전 — 백업 실행"
+          fi
+
       - uses: actions/setup-python@v5
+        if: steps.gate.outputs.skip != 'true'
         with:
           python-version: '3.11'
 
       - name: 라이브러리 설치
+        if: steps.gate.outputs.skip != 'true'
         run: |
           python -m pip install --upgrade pip
           pip install pandas numpy finance-datareader yfinance pykrx lxml html5lib beautifulsoup4 requests
 
       - name: 데이터 생성
+        if: steps.gate.outputs.skip != 'true'
         env:
           DART_API_KEY: ${{ secrets.DART_API_KEY }}
+          # 선택: KRX 데이터포털 계정(2026-02부터 로그인 필수). 없으면 FDR·네이버·yfinance로 대체.
+          KRX_ID: ${{ secrets.KRX_ID }}
+          KRX_PW: ${{ secrets.KRX_PW }}
         run: python build_data.py
 
       - name: 커밋
+        if: steps.gate.outputs.skip != 'true'
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
