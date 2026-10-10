@@ -283,22 +283,26 @@ def naver_stock(code):
 
 
 def fetch_index(code, market):
+    # FDR KS11/KQ11 can stall weeks behind while still returning long history.
+    # Collect every viable source and keep the series with the newest last bar.
     tries = []
-    if market == "KR" and HAS_FDR:
-        tries.append(("fdr", lambda: fdr.DataReader(code, "2018-01-01")))
     if HAS_YF:
         yq = {"KS11": "^KS11", "KQ11": "^KQ11"}.get(code, code)
-        tries.append(("yf", lambda: yf.Ticker(yq).history(period="6y", auto_adjust=True)))
+        tries.append(("yf", lambda q=yq: yf.Ticker(q).history(period="6y", auto_adjust=True)))
     if HAS_FDR:
-        tries.append(("fdr2", lambda: fdr.DataReader(code, "2018-01-01")))
+        tries.append(("fdr", lambda: fdr.DataReader(code, "2018-01-01")))
+    best, best_nm, best_last = None, None, None
     for nm, fn in tries:
         try:
             d = clean(fn())
-            if d is not None and len(d) > 200:
-                return d, nm
+            if d is None or len(d) <= 200:
+                continue
+            last = d.index.max()
+            if best is None or last > best_last:
+                best, best_nm, best_last = d, nm, last
         except Exception as e:
             log(f"지수 {code}", "재시도", f"{nm}: {type(e).__name__}")
-    return None, None
+    return (best, best_nm) if best is not None else (None, None)
 
 
 # ════════════════════════════════════════════════════════════════════
