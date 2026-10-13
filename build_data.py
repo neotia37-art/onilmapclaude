@@ -282,27 +282,82 @@ def naver_stock(code):
     return out
 
 
+def naver_index(code, start="20180101"):
+    """네이버 fchart 일봉 (KOSPI/KOSDAQ) — KRX 로그인 없이 당일 봉까지 제공."""
+    sym = {"KS11": "KOSPI", "KQ11": "KOSDAQ"}.get(code)
+    if not sym or not requests:
+        return None
+    end = datetime.now(KST).strftime("%Y%m%d")
+    t = requests.get("https://fchart.stock.naver.com/siseJson.nhn",
+                     params={"symbol": sym, "requestType": 1, "startTime": start,
+                             "endTime": end, "timeframe": "day"},
+                     headers=UA, timeout=15).text
+    rows = re.findall(r'\["(\d{8})",\s*([\d.]+),\s*([\d.]+),\s*([\d.]+),\s*([\d.]+),\s*([\d.]+)', t)
+    if not rows:
+        return None
+    d = pd.DataFrame([[float(x) for x in r[1:]] for r in rows],
+                     columns=["Open", "High", "Low", "Close", "Volume"],
+                     index=pd.to_datetime([r[0] for r in rows], format="%Y%m%d"))
+    return d
+
+
+def _merge_newer(base, extra, max_jump=0.3):
+    """base 이후 날짜의 extra 봉을 이어 붙인다. 겹치는 날 종가가 크게 어긋나거나
+    하루 변동이 max_jump를 넘으면(스케일 불일치·오류) 붙이지 않는다."""
+    if extra is None or len(extra) == 0:
+        return base
+    last = base.index.max()
+    newer = extra[extra.index > last]
+    if len(newer) == 0:
+        return base
+    common = base.index.intersection(extra.index)
+    if len(common):
+        ref = common.max()
+        if abs(float(extra.loc[ref, "Close"]) / float(base.loc[ref, "Close"]) - 1) > 0.02:
+            return base
+    prev = float(base["Close"].iloc[-1])
+    for c in newer["Close"]:
+        if not (0 < c and abs(c / prev - 1) <= max_jump):
+            return base
+        prev = float(c)
+    return pd.concat([base, newer[base.columns]]).sort_index()
+
+
 def fetch_index(code, market):
-    # FDR KS11/KQ11 can stall weeks behind while still returning long history.
-    # Collect every viable source and keep the series with the newest last bar.
+    # Every source can lag (FDR stalled for weeks, Yahoo's daily KR bars can trail by
+    # days). Fetch all viable sources, take the longest history as the base, then
+    # append any newer validated bars from the others so the newest close wins.
     tries = []
     if HAS_YF:
         yq = {"KS11": "^KS11", "KQ11": "^KQ11"}.get(code, code)
         tries.append(("yf", lambda q=yq: yf.Ticker(q).history(period="6y", auto_adjust=True)))
     if HAS_FDR:
         tries.append(("fdr", lambda: fdr.DataReader(code, "2018-01-01")))
-    best, best_nm, best_last = None, None, None
+    if market == "KR":
+        tries.append(("naver", lambda: naver_index(code)))
+    got = []
     for nm, fn in tries:
         try:
             d = clean(fn())
-            if d is None or len(d) <= 200:
+            if d is None or len(d) == 0:
                 continue
-            last = d.index.max()
-            if best is None or last > best_last:
-                best, best_nm, best_last = d, nm, last
+            got.append((nm, d))
         except Exception as e:
             log(f"지수 {code}", "재시도", f"{nm}: {type(e).__name__}")
-    return (best, best_nm) if best is not None else (None, None)
+    long_ = [(nm, d) for nm, d in got if len(d) > 200]
+    if not long_:
+        return None, None
+    # base: newest last bar among long series (tie → longer)
+    nm, best = max(long_, key=lambda x: (x[1].index.max(), len(x[1])))
+    used = [nm]
+    for onm, d in sorted(got, key=lambda x: x[1].index.max(), reverse=True):
+        if onm == nm:
+            continue
+        m = _merge_newer(best, d)
+        if m is not best:
+            best = m
+            used.append(onm)
+    return best, "+".join(used)
 
 
 # ════════════════════════════════════════════════════════════════════
